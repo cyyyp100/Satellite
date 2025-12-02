@@ -14,16 +14,40 @@ from LSTM import LSTMModel
 from MLP import MLPModel
 
 
-class SequenceDataset(Dataset):
-    def __init__(self, X_seq: np.ndarray, Y_seq: np.ndarray):
+class SatelliteSequenceDataset(Dataset):
+    def __init__(
+        self,
+        X_seq: np.ndarray,
+        Y_seq: np.ndarray,
+        train_ratio: float,
+        val_ratio: float,
+        mode: str = "train",
+        splits: Dict[str, Tuple[int, int]] | None = None,
+    ):
         self.X_seq = X_seq
         self.Y_seq = Y_seq
+        n_samples = X_seq.shape[0]
+        if splits is None:
+            train_end = int(n_samples * train_ratio)
+            val_end = int(n_samples * (train_ratio + val_ratio))
+            splits = {"train": (0, train_end), "valid": (train_end, val_end), "test": (val_end, n_samples)}
+        self.splits = splits
+        self.mode = "train"
+        self.set_mode(mode)
+
+    def set_mode(self, mode: str) -> None:
+        if mode not in self.splits:
+            raise ValueError(f"Mode {mode} inconnu. Utilisez 'train', 'valid' ou 'test'.")
+        start, end = self.splits[mode]
+        self.current_X = self.X_seq[start:end]
+        self.current_Y = self.Y_seq[start:end]
+        self.mode = mode
 
     def __len__(self) -> int:
-        return self.X_seq.shape[0]
+        return self.current_X.shape[0]
 
     def __getitem__(self, idx: int):
-        return torch.tensor(self.X_seq[idx], dtype=torch.float32), torch.tensor(self.Y_seq[idx], dtype=torch.float32)
+        return torch.tensor(self.current_X[idx], dtype=torch.float32), torch.tensor(self.current_Y[idx], dtype=torch.float32)
 
 
 def set_seed(seed: int) -> None:
@@ -150,11 +174,15 @@ def create_dataloaders(
     train_ratio: float,
     val_ratio: float,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
-    (X_train, Y_train), (X_val, Y_val), (X_test, Y_test) = split_sequences(X_seq, Y_seq, train_ratio, val_ratio)
+    template_dataset = SatelliteSequenceDataset(X_seq, Y_seq, train_ratio, val_ratio, mode="train")
+    splits = template_dataset.splits
 
-    train_dataset = SequenceDataset(X_train, Y_train)
-    val_dataset = SequenceDataset(X_val, Y_val)
-    test_dataset = SequenceDataset(X_test, Y_test)
+    train_dataset = SatelliteSequenceDataset(X_seq, Y_seq, train_ratio, val_ratio, mode="train", splits=splits)
+    train_dataset.set_mode("train")
+    val_dataset = SatelliteSequenceDataset(X_seq, Y_seq, train_ratio, val_ratio, mode="valid", splits=splits)
+    val_dataset.set_mode("valid")
+    test_dataset = SatelliteSequenceDataset(X_seq, Y_seq, train_ratio, val_ratio, mode="test", splits=splits)
+    test_dataset.set_mode("test")
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)

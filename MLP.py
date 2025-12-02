@@ -5,16 +5,6 @@ import torch
 from torch import nn
 
 
-def _select_device(device: Optional[str] = None) -> torch.device:
-    if device:
-        return torch.device(device)
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    return torch.device("cpu")
-
-
 class EarlyStopping:
     """Early stopping utility monitoring the validation loss."""
 
@@ -48,7 +38,11 @@ class MLPModel(nn.Module):
         super().__init__()
         self.lr = lr
         self.optimizer_cls = optimizer_cls
-        self.device = _select_device(device)
+        self.device = (
+            torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
+            if device is None
+            else torch.device(device)
+        )
         self.input_dim = input_dim
 
         layers: List[nn.Module] = []
@@ -60,7 +54,8 @@ class MLPModel(nn.Module):
             last_dim = int(h)
         layers.append(nn.Linear(last_dim, 3))
         self.net = nn.Sequential(*layers)
-        self.to(self.device)
+        self.model = self
+        self.model.to(self.device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch_size = x.size(0)

@@ -5,16 +5,6 @@ import torch
 from torch import nn
 
 
-def _select_device(device: Optional[str] = None) -> torch.device:
-    if device:
-        return torch.device(device)
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    return torch.device("cpu")
-
-
 class EarlyStopping:
     """Early stopping utility monitoring the validation loss."""
 
@@ -50,7 +40,11 @@ class GRUModel(nn.Module):
         self.hidden_size = hidden_size
         self.lr = lr
         self.optimizer_cls = optimizer_cls
-        self.device = _select_device(device)
+        self.device = (
+            torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
+            if device is None
+            else torch.device(device)
+        )
 
         self.gru = nn.GRU(
             input_size=input_size,
@@ -60,7 +54,8 @@ class GRUModel(nn.Module):
             dropout=dropout if num_layers > 1 else 0.0,
         )
         self.fc = nn.Linear(hidden_size, 3)
-        self.to(self.device)
+        self.model = self
+        self.model.to(self.device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out, _ = self.gru(x)
