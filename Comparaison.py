@@ -211,8 +211,9 @@ def main() -> None:
         dropout=args.dropout,
         lr=args.learning_rate,
     )
+    gru_label = f"GRU ({args.epochs} epochs, {args.gru_hidden} blocs, learning rate = {args.learning_rate})"
     start = time.time()
-    histories["GRU"] = gru_model.train_model(train_loader, val_loader, epochs=args.epochs, lr=args.learning_rate)
+    histories[gru_label] = gru_model.train_model(train_loader, val_loader, epochs=args.epochs, lr=args.learning_rate)
     print(f"Temps total GRU : {time.time() - start:.2f}s")
 
     # LSTM
@@ -223,15 +224,17 @@ def main() -> None:
         dropout=args.dropout,
         lr=args.learning_rate,
     )
+    lstm_label = f"LSTM ({args.epochs} epochs, {args.lstm_hidden} blocs, learning rate = {args.learning_rate})"
     start = time.time()
-    histories["LSTM"] = lstm_model.train_model(train_loader, val_loader, epochs=args.epochs, lr=args.learning_rate)
+    histories[lstm_label] = lstm_model.train_model(train_loader, val_loader, epochs=args.epochs, lr=args.learning_rate)
     print(f"Temps total LSTM : {time.time() - start:.2f}s")
 
     # MLP
     mlp_hidden = parse_mlp_hidden(args.mlp_hidden)
     mlp_model = MLPModel(input_dim=input_size, hidden_dims=mlp_hidden, dropout=args.dropout, lr=args.learning_rate)
+    mlp_label = f"MLP ({args.epochs} epochs, hidden={mlp_hidden}, learning rate = {args.learning_rate})"
     start = time.time()
-    histories["MLP"] = mlp_model.train_model(train_loader, val_loader, epochs=args.epochs, lr=args.learning_rate)
+    histories[mlp_label] = mlp_model.train_model(train_loader, val_loader, epochs=args.epochs, lr=args.learning_rate)
     print(f"Temps total MLP : {time.time() - start:.2f}s")
 
     plot_histories(histories)
@@ -239,4 +242,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
