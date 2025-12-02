@@ -1,23 +1,30 @@
 import time
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Type
 
-import numpy as np
 import torch
 from torch import nn
 
 
-def _select_device(device: Optional[str] = None) -> torch.device:
-    if device:
-        return torch.device(device)
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    return torch.device("cpu")
+class EarlyStopping:
+    """Early stopping utility monitoring the validation loss."""
+
+    def __init__(self, patience: int = 10, min_delta: float = 0.0):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.best_loss: float = float("inf")
+        self.counter = 0
+
+    def step(self, loss: float) -> bool:
+        if loss < self.best_loss - self.min_delta:
+            self.best_loss = loss
+            self.counter = 0
+        else:
+            self.counter += 1
+        return self.counter >= self.patience
 
 
 class MLPModel(nn.Module):
-    """Simple MLP that operates on the last timestep of a sequence."""
+    """Simple MLP that consomme la séquence flattenée."""
 
     def __init__(
         self,
@@ -31,7 +38,12 @@ class MLPModel(nn.Module):
         super().__init__()
         self.lr = lr
         self.optimizer_cls = optimizer_cls
-        self.device = _select_device(device)
+        self.device = (
+            torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
+            if device is None
+            else torch.device(device)
+        )
+        self.input_dim = input_dim
 
         layers: List[nn.Module] = []
         last_dim = input_dim
@@ -42,11 +54,18 @@ class MLPModel(nn.Module):
             last_dim = int(h)
         layers.append(nn.Linear(last_dim, 3))
         self.net = nn.Sequential(*layers)
+        # Move the whole module to the chosen device
         self.to(self.device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_last = x[:, -1, :]
-        return self.net(x_last)
+        batch_size = x.size(0)
+        flattened = x.reshape(batch_size, -1)
+        if flattened.shape[1] != self.input_dim:
+            raise ValueError(
+                f"Dimension d'entrée inattendue pour le MLP: {flattened.shape[1]} au lieu de {self.input_dim}. "
+                "Vérifiez que seq_len et input_size correspondent au flattening."
+            )
+        return self.net(flattened)
 
     def train_model(
         self,
@@ -56,10 +75,13 @@ class MLPModel(nn.Module):
         lr: Optional[float] = None,
         weight_decay: float = 0.0,
         verbose: bool = True,
+        patience: int = 10,
+        min_delta: float = 0.0,
     ) -> Dict[str, List[float]]:
         optimizer = self.optimizer_cls(self.parameters(), lr=lr or self.lr, weight_decay=weight_decay)
         criterion = nn.MSELoss()
         history = {"train_loss": [], "val_loss": [], "train_rmse": [], "val_rmse": [], "epoch_time": []}
+        stopper = EarlyStopping(patience=patience, min_delta=min_delta)
 
         if verbose:
             print("""\nMLP Training Metrics""")
@@ -85,6 +107,11 @@ class MLPModel(nn.Module):
                     f"{train_rmse:11.6f} {val_rmse:10.6f} "
                     f"{duration:7.2f}"
                 )
+
+            if stopper.step(val_loss):
+                if verbose:
+                    print(f"Arrêt anticipé à l'époque {epoch} (pas d'amélioration du MSE validation)")
+                break
 
         return history
 
