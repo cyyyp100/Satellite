@@ -54,8 +54,8 @@ class LSTMModel(nn.Module):
             dropout=dropout if num_layers > 1 else 0.0,
         )
         self.fc = nn.Linear(hidden_size, 3)
-        self.model = self
-        self.model.to(self.device)
+        # Move the whole module to the chosen device
+        self.to(self.device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out, _ = self.lstm(x)

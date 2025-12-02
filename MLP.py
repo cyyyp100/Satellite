@@ -54,8 +54,8 @@ class MLPModel(nn.Module):
             last_dim = int(h)
         layers.append(nn.Linear(last_dim, 3))
         self.net = nn.Sequential(*layers)
-        self.model = self
-        self.model.to(self.device)
+        # Move the whole module to the chosen device
+        self.to(self.device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch_size = x.size(0)
