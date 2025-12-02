@@ -1,0 +1,285 @@
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+import matplotlib.pyplot as plt
+from typing import Dict, Any, List
+import pandas as pd
+
+
+class SatelliteSequenceDataset(Dataset):
+    def __init__(self, X, Y, seq_len=128, train_ratio=0.8):
+        self.X = X
+        self.Y = Y
+        self.seq_len = seq_len
+
+        assert X.shape[0] == Y.shape[0], "X and Y must align in time"
+
+        split = int(X.shape[0] * train_ratio)
+        self.X_train, self.Y_train = X[:split], Y[:split]
+        self.X_valid, self.Y_valid = X[split:], Y[split:]
+
+        self.train_mode = True
+
+    def set_mode(self, mode="train"):
+        self.train_mode = (mode == "train")
+
+    def __len__(self):
+        data = self.X_train if self.train_mode else self.X_valid
+        return len(data) - self.seq_len
+
+    def __getitem__(self, idx):
+        X_data = self.X_train if self.train_mode else self.X_valid
+        Y_data = self.Y_train if self.train_mode else self.Y_valid
+
+        X_seq = X_data[idx : idx + self.seq_len]        # (seq_len, features)
+        y = Y_data[idx + self.seq_len - 1]              # prédiction du dernier pas
+
+        return torch.tensor(X_seq, dtype=torch.float32), torch.tensor(y, dtype=torch.float32)
+
+
+class GRUModel(nn.Module):
+    def __init__(self, input_size, hidden_size=128, num_layers=2, dropout=0.1):
+        super().__init__()
+
+        self.gru = nn.GRU(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout
+        )
+
+        # Couche finale pour prédire x,y,z
+        self.fc = nn.Linear(hidden_size, 3)
+
+    def forward(self, x):
+        # x shape : (batch, seq_len, features)
+        out, h = self.gru(x)
+        last = out[:, -1, :]  # dernier état caché
+        return self.fc(last)
+
+
+class EarlyStopping:
+    def __init__(self, patience=20, min_delta=1e-5):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best_loss = np.inf
+        self.early_stop = False
+
+    def __call__(self, loss):
+        if loss < self.best_loss - self.min_delta:
+            self.best_loss = loss
+            self.counter = 0
+        else:
+            self.counter += 1
+        
+        if self.counter >= self.patience:
+            self.early_stop = True
+
+
+class GRUTrainer:
+    def __init__(self, model, lr=1e-3, device="mps"):
+        self.device = torch.device(device if torch.backends.mps.is_available() else "cpu")
+        print(f"Using device: {self.device}")
+        self.model = model.to(self.device)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+        self.loss_fn = nn.MSELoss()
+
+        self.history = {"train_loss": [], "valid_loss": [], 
+                        "train_rmse": [], "valid_rmse": []}
+
+    def train_epoch(self, loader):
+        self.model.train()
+        losses, rmses = [], []
+
+        for X, y in loader:
+            X, y = X.to(self.device), y.to(self.device)
+
+            pred = self.model(X)
+            loss = self.loss_fn(pred, y)
+
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+
+            losses.append(loss.item())
+            rmse = np.sqrt(loss.item())
+            rmses.append(rmse)
+
+        return np.mean(losses), np.mean(rmses)
+
+    def eval_epoch(self, loader):
+        self.model.eval()
+        losses, rmses = [], []
+
+        with torch.no_grad():
+            for X, y in loader:
+                X, y = X.to(self.device), y.to(self.device)
+                pred = self.model(X)
+                loss = self.loss_fn(pred, y)
+
+                losses.append(loss.item())
+                rmses.append(np.sqrt(loss.item()))
+
+        return np.mean(losses), np.mean(rmses)
+
+    def fit(self, train_loader, valid_loader, epochs=100, patience=20):
+        es = EarlyStopping(patience=patience)
+
+        for epoch in range(epochs):
+            train_loss, train_rmse = self.train_epoch(train_loader)
+            valid_loss, valid_rmse = self.eval_epoch(valid_loader)
+
+            self.history["train_loss"].append(train_loss)
+            self.history["valid_loss"].append(valid_loss)
+            self.history["train_rmse"].append(train_rmse)
+            self.history["valid_rmse"].append(valid_rmse)
+
+            print(f"[EPOCH {epoch+1}] "
+                  f"Train Loss={train_loss:.6f} | Valid Loss={valid_loss:.6f} "
+                  f"| RMSE={valid_rmse:.6f}")
+
+            es(valid_loss)
+            if es.early_stop:
+                print("⛔ Early stopping triggered.")
+                break
+
+        return self.history
+
+
+class ExperimentRunner:
+    def __init__(self):
+        self.results = []
+
+    def run(self, name, model, trainer, train_loader, valid_loader, epochs=120, patience=20):
+        print(f"\n🚀 Running experiment: {name}")
+        history = trainer.fit(train_loader, valid_loader, epochs, patience)
+        self.results.append({"name": name, "history": history})
+        return history
+
+    def plot(self):
+        plt.figure(figsize=(14,6))
+
+        for res in self.results:
+            plt.plot(res["history"]["valid_rmse"], label=res["name"])
+
+        plt.title("Comparaison des RMSE Validation (GRU)")
+        plt.xlabel("Epoch")
+        plt.ylabel("RMSE")
+        plt.legend()
+        plt.grid(True)
+        plt.show()
+
+
+if __name__ == "__main__":
+
+    # ---------------------
+    # Load real dataset
+    # ---------------------
+    csv_path = "datasetISS_200TLE.csv"  # adapter le chemin si besoin
+    df = pd.read_csv(csv_path, sep=";")
+
+    # Supprimer dx, dy, dz si présents
+    for col in ["dx_km", "dy_km", "dz_km"]:
+        if col in df.columns:
+            df = df.drop(columns=[col])
+
+    # Colonnes d'entrée X
+    X_cols = [
+        "time_utc",
+        "tle_index",
+        "tle_epoch",
+        "dt_since_tle_s",
+        "mean_motion",
+        "orbital_speed_km_s",
+        "mean_motion_derivative",
+        "altitude_drift_km_per_day",
+        "bstar",
+        "inclination_deg",
+        "raan_deg",
+        "eccentricity",
+        "arg_perigee_deg",
+        "mean_anomaly_deg",
+        "rev_number",
+        "x_sgp4_km",
+        "y_sgp4_km",
+        "z_sgp4_km",
+    ]
+
+    # Conversion des dates en timestamps numériques
+    if "time_utc" in df.columns:
+        df["time_utc"] = pd.to_datetime(df["time_utc"]).astype("int64") / 1e9  # secondes
+    if "tle_epoch" in df.columns:
+        df["tle_epoch"] = pd.to_datetime(df["tle_epoch"]).astype("int64") / 1e9
+
+    # Debug: afficher les colonnes disponibles pour vérifier les noms réels
+    print("Colonnes du CSV :", list(df.columns))
+
+    # Petite fonction utilitaire pour retrouver une colonne Horizons même si le nom varie un peu
+    def find_col(candidates):
+        cols_lower = {c.lower().strip(): c for c in df.columns}
+        for cand in candidates:
+            key = cand.lower().strip()
+            if key in cols_lower:
+                return cols_lower[key]
+        # Ultime recours : chercher en 'contains'
+        for key, original in cols_lower.items():
+            for cand in candidates:
+                if cand.lower().strip() in key:
+                    return original
+        raise KeyError(f"Aucune colonne trouvée parmi {candidates} dans {df.columns}")
+
+    # On essaie plusieurs variantes possibles des noms de colonnes Horizons
+    x_h_col = find_col(["x_horizons_km", "x_horizon_km", "x_horizons"])
+    y_h_col = find_col(["y_horizons_km", "y_horizon_km", "y_horizons"])
+    z_h_col = find_col(["z_horizons_km", "z_horizon_km", "z_horizons"])
+
+    # Calcul des erreurs SGP4 -> Horizons
+    df["err_x"] = df[x_h_col] - df["x_sgp4_km"]
+    df["err_y"] = df[y_h_col] - df["y_sgp4_km"]
+    df["err_z"] = df[z_h_col] - df["z_sgp4_km"]
+
+    # Matrices numpy
+    X = df[X_cols].values.astype(np.float32)
+    Y = df[["err_x", "err_y", "err_z"]].values.astype(np.float32)
+
+    # Normalisation simple (z-score) de X
+    X_mean = X.mean(axis=0, keepdims=True)
+    X_std = X.std(axis=0, keepdims=True) + 1e-8
+    X = (X - X_mean) / X_std
+
+    seq_len = 128
+    batch_size = 32
+
+    dataset = SatelliteSequenceDataset(X, Y, seq_len=seq_len)
+
+    train_set, valid_set = dataset, dataset  # same object, mode changes
+    train_set.set_mode("train")
+    valid_set.set_mode("valid")
+
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
+    valid_loader = DataLoader(valid_set, batch_size=batch_size, shuffle=False)
+
+    # ---------------------
+    # RUN EXPERIMENTS
+    # ---------------------
+    runner = ExperimentRunner()
+
+    # Experiment 1
+    model1 = GRUModel(input_size=18, hidden_size=64, num_layers=1)
+    trainer1 = GRUTrainer(model1, lr=1e-3)
+
+    runner.run("GRU_64_hidden_lr1e-3", model1, trainer1, train_loader, valid_loader)
+
+    # Experiment 2
+    model2 = GRUModel(input_size=18, hidden_size=128, num_layers=2)
+    trainer2 = GRUTrainer(model2, lr=5e-4)
+
+    runner.run("GRU_128_hidden_lr5e-4", model2, trainer2, train_loader, valid_loader)
+
+    # ---------------------
+    # Plot results
+    # ---------------------
+    runner.plot()
