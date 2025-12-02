@@ -1,281 +1,134 @@
+import time
+from typing import Dict, List, Optional, Tuple, Type
+
 import numpy as np
 import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-import matplotlib.pyplot as plt
-from typing import Dict, Any, List
-import pandas as pd
+from torch import nn
 
 
-class SatelliteSequenceDataset(Dataset):
-    def __init__(self, X, Y, seq_len=128, train_ratio=0.8):
-        self.X = X
-        self.Y = Y
-        self.seq_len = seq_len
-
-        assert X.shape[0] == Y.shape[0], "X and Y must align in time"
-
-        split = int(X.shape[0] * train_ratio)
-        self.X_train, self.Y_train = X[:split], Y[:split]
-        self.X_valid, self.Y_valid = X[split:], Y[split:]
-
-        self.train_mode = True
-
-    def set_mode(self, mode="train"):
-        self.train_mode = (mode == "train")
-
-    def __len__(self):
-        data = self.X_train if self.train_mode else self.X_valid
-        return len(data) - self.seq_len
-
-    def __getitem__(self, idx):
-        X_data = self.X_train if self.train_mode else self.X_valid
-        Y_data = self.Y_train if self.train_mode else self.Y_valid
-
-        X_seq = X_data[idx : idx + self.seq_len]        # (seq_len, features)
-        y = Y_data[idx + self.seq_len - 1]              # prédiction du dernier pas
-
-        return torch.tensor(X_seq, dtype=torch.float32), torch.tensor(y, dtype=torch.float32)
+def _select_device(device: Optional[str] = None) -> torch.device:
+    """Choose the best available device or honor the user choice."""
+    if device:
+        return torch.device(device)
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
 
 
 class LSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers):
+    """LSTM model with a built-in training loop for convenience."""
+
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int = 64,
+        num_layers: int = 1,
+        dropout: float = 0.1,
+        lr: float = 1e-3,
+        optimizer_cls: Type[torch.optim.Optimizer] = torch.optim.Adam,
+        device: Optional[str] = None,
+    ):
         super().__init__()
+        self.hidden_size = hidden_size
+        self.lr = lr
+        self.optimizer_cls = optimizer_cls
+        self.device = _select_device(device)
+
         self.lstm = nn.LSTM(
             input_size=input_size,
             hidden_size=hidden_size,
             num_layers=num_layers,
             batch_first=True,
-            dropout=0.1 if num_layers > 1 else 0.0,
+            dropout=dropout if num_layers > 1 else 0.0,
         )
         self.fc = nn.Linear(hidden_size, 3)
+        self.to(self.device)
 
-    def forward(self, x):
-        out, _ = self.lstm(x)        # LSTM renvoie (out, (h_n, c_n)), mais on s’en fout
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out, _ = self.lstm(x)
         last = out[:, -1, :]
         return self.fc(last)
 
+    def train_model(
+        self,
+        train_loader: torch.utils.data.DataLoader,
+        val_loader: torch.utils.data.DataLoader,
+        epochs: int = 50,
+        lr: Optional[float] = None,
+        weight_decay: float = 0.0,
+        verbose: bool = True,
+    ) -> Dict[str, List[float]]:
+        optimizer = self.optimizer_cls(self.parameters(), lr=lr or self.lr, weight_decay=weight_decay)
+        criterion = nn.MSELoss()
+        history = {"train_loss": [], "val_loss": [], "train_rmse": [], "val_rmse": [], "epoch_time": []}
 
-class EarlyStopping:
-    def __init__(self, patience=20, min_delta=1e-5):
-        self.patience = patience
-        self.min_delta = min_delta
-        self.counter = 0
-        self.best_loss = np.inf
-        self.early_stop = False
+        if verbose:
+            print("""\nLSTM Training Metrics""")
+            print("Epoch | Train_MSE   Val_MSE     Train_RMSE  Val_RMSE   Time(s)")
+            print("-" * 64)
 
-    def __call__(self, loss):
-        if loss < self.best_loss - self.min_delta:
-            self.best_loss = loss
-            self.counter = 0
-        else:
-            self.counter += 1
-        
-        if self.counter >= self.patience:
-            self.early_stop = True
+        for epoch in range(1, epochs + 1):
+            start = time.perf_counter()
+            train_loss, train_rmse = self._run_epoch(train_loader, optimizer, criterion, training=True)
+            val_loss, val_rmse = self._run_epoch(val_loader, optimizer, criterion, training=False)
+            duration = time.perf_counter() - start
 
+            history["train_loss"].append(train_loss)
+            history["val_loss"].append(val_loss)
+            history["train_rmse"].append(train_rmse)
+            history["val_rmse"].append(val_rmse)
+            history["epoch_time"].append(duration)
 
-class LSTMTrainer:
-    def __init__(self, model, lr=1e-3, device="mps"):
-        self.device = torch.device(device if torch.backends.mps.is_available() else "cpu")
-        print(f"Using device: {self.device}")
-        self.model = model.to(self.device)
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
-        self.loss_fn = nn.MSELoss()
+            if verbose:
+                print(
+                    f"{epoch:5d} | "
+                    f"{train_loss:10.6f} {val_loss:11.6f} "
+                    f"{train_rmse:11.6f} {val_rmse:10.6f} "
+                    f"{duration:7.2f}"
+                )
 
-        self.history = {"train_loss": [], "valid_loss": [], 
-                        "train_rmse": [], "valid_rmse": []}
-
-    def train_epoch(self, loader):
-        self.model.train()
-        losses, rmses = [], []
-
-        for X, y in loader:
-            X, y = X.to(self.device), y.to(self.device)
-
-            pred = self.model(X)
-            loss = self.loss_fn(pred, y)
-
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
-
-            losses.append(loss.item())
-            rmse = np.sqrt(loss.item())
-            rmses.append(rmse)
-
-        return np.mean(losses), np.mean(rmses)
-
-    def eval_epoch(self, loader):
-        self.model.eval()
-        losses, rmses = [], []
-
-        with torch.no_grad():
-            for X, y in loader:
-                X, y = X.to(self.device), y.to(self.device)
-                pred = self.model(X)
-                loss = self.loss_fn(pred, y)
-
-                losses.append(loss.item())
-                rmses.append(np.sqrt(loss.item()))
-
-        return np.mean(losses), np.mean(rmses)
-
-    def fit(self, train_loader, valid_loader, epochs=100, patience=20):
-        es = EarlyStopping(patience=patience)
-
-        for epoch in range(epochs):
-            train_loss, train_rmse = self.train_epoch(train_loader)
-            valid_loss, valid_rmse = self.eval_epoch(valid_loader)
-
-            self.history["train_loss"].append(train_loss)
-            self.history["valid_loss"].append(valid_loss)
-            self.history["train_rmse"].append(train_rmse)
-            self.history["valid_rmse"].append(valid_rmse)
-
-            print(f"[EPOCH {epoch+1}] "
-                  f"Train Loss={train_loss:.6f} | Valid Loss={valid_loss:.6f} "
-                  f"| RMSE={valid_rmse:.6f}")
-
-            es(valid_loss)
-            if es.early_stop:
-                print("⛔ Early stopping triggered.")
-                break
-
-        return self.history
-
-
-class ExperimentRunner:
-    def __init__(self):
-        self.results = []
-
-    def run(self, name, model, trainer, train_loader, valid_loader, epochs=120, patience=20):
-        print(f"\n🚀 Running experiment: {name}")
-        history = trainer.fit(train_loader, valid_loader, epochs, patience)
-        self.results.append({"name": name, "history": history})
         return history
 
-    def plot(self):
-        plt.figure(figsize=(14,6))
+    def _run_epoch(
+        self,
+        loader: torch.utils.data.DataLoader,
+        optimizer: torch.optim.Optimizer,
+        criterion: nn.Module,
+        training: bool,
+    ) -> Tuple[float, float]:
+        if training:
+            self.train()
+        else:
+            self.eval()
 
-        for res in self.results:
-            plt.plot(res["history"]["valid_rmse"], label=res["name"])
+        total_loss = 0.0
+        total_rmse = 0.0
+        total_samples = 0
 
-        plt.title("Comparaison des RMSE Validation (LSTM)")
-        plt.xlabel("Epoch")
-        plt.ylabel("RMSE")
-        plt.legend()
-        plt.grid(True)
-        plt.show()
+        with torch.set_grad_enabled(training):
+            for xb, yb in loader:
+                xb = xb.to(self.device)
+                yb = yb.to(self.device)
 
+                preds = self(xb)
+                loss = criterion(preds, yb)
 
-if __name__ == "__main__":
+                if training:
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
 
-    # ---------------------
-    # Load real dataset
-    # ---------------------
-    csv_path = "datasetISS_200TLE.csv"  # adapter le chemin si besoin
-    df = pd.read_csv(csv_path, sep=";")
+                batch_size = xb.size(0)
+                mse_value = loss.item()
+                rmse_value = torch.sqrt(torch.mean((preds - yb) ** 2)).item()
 
-    # Supprimer dx, dy, dz si présents
-    for col in ["dx_km", "dy_km", "dz_km"]:
-        if col in df.columns:
-            df = df.drop(columns=[col])
+                total_loss += mse_value * batch_size
+                total_rmse += rmse_value * batch_size
+                total_samples += batch_size
 
-    # Colonnes d'entrée X
-    X_cols = [
-        "time_utc",
-        "tle_index",
-        "tle_epoch",
-        "dt_since_tle_s",
-        "mean_motion",
-        "orbital_speed_km_s",
-        "mean_motion_derivative",
-        "altitude_drift_km_per_day",
-        "bstar",
-        "inclination_deg",
-        "raan_deg",
-        "eccentricity",
-        "arg_perigee_deg",
-        "mean_anomaly_deg",
-        "rev_number",
-        "x_sgp4_km",
-        "y_sgp4_km",
-        "z_sgp4_km",
-    ]
+        avg_loss = total_loss / max(total_samples, 1)
+        avg_rmse = total_rmse / max(total_samples, 1)
+        return avg_loss, avg_rmse
 
-    # Conversion des dates en timestamps numériques
-    if "time_utc" in df.columns:
-        df["time_utc"] = pd.to_datetime(df["time_utc"]).astype("int64") / 1e9  # secondes
-    if "tle_epoch" in df.columns:
-        df["tle_epoch"] = pd.to_datetime(df["tle_epoch"]).astype("int64") / 1e9
-
-    # Debug: afficher les colonnes disponibles pour vérifier les noms réels
-    print("Colonnes du CSV :", list(df.columns))
-
-    # Petite fonction utilitaire pour retrouver une colonne Horizons même si le nom varie un peu
-    def find_col(candidates):
-        cols_lower = {c.lower().strip(): c for c in df.columns}
-        for cand in candidates:
-            key = cand.lower().strip()
-            if key in cols_lower:
-                return cols_lower[key]
-        # Ultime recours : chercher en 'contains'
-        for key, original in cols_lower.items():
-            for cand in candidates:
-                if cand.lower().strip() in key:
-                    return original
-        raise KeyError(f"Aucune colonne trouvée parmi {candidates} dans {df.columns}")
-
-    # On essaie plusieurs variantes possibles des noms de colonnes Horizons
-    x_h_col = find_col(["x_horizons_km", "x_horizon_km", "x_horizons"])
-    y_h_col = find_col(["y_horizons_km", "y_horizon_km", "y_horizons"])
-    z_h_col = find_col(["z_horizons_km", "z_horizon_km", "z_horizons"])
-
-    # Calcul des erreurs SGP4 -> Horizons
-    df["err_x"] = df[x_h_col] - df["x_sgp4_km"]
-    df["err_y"] = df[y_h_col] - df["y_sgp4_km"]
-    df["err_z"] = df[z_h_col] - df["z_sgp4_km"]
-
-    # Matrices numpy
-    X = df[X_cols].values.astype(np.float32)
-    Y = df[["err_x", "err_y", "err_z"]].values.astype(np.float32)
-
-    # Normalisation simple (z-score) de X
-    X_mean = X.mean(axis=0, keepdims=True)
-    X_std = X.std(axis=0, keepdims=True) + 1e-8
-    X = (X - X_mean) / X_std
-
-    seq_len = 128
-    batch_size = 32
-
-    dataset = SatelliteSequenceDataset(X, Y, seq_len=seq_len)
-
-    train_set, valid_set = dataset, dataset  # same object, mode changes
-    train_set.set_mode("train")
-    valid_set.set_mode("valid")
-
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
-    valid_loader = DataLoader(valid_set, batch_size=batch_size, shuffle=False)
-
-    # ---------------------
-    # RUN EXPERIMENTS
-    # ---------------------
-    runner = ExperimentRunner()
-
-    # Experiment 1
-    model1 = LSTMModel(input_size=18, hidden_size=64, num_layers=1)
-    trainer1 = LSTMTrainer(model1, lr=1e-3)
-
-    runner.run("LSTM_64_hidden_lr1e-3", model1, trainer1, train_loader, valid_loader)
-
-    # Experiment 2
-    model2 = LSTMModel(input_size=18, hidden_size=128, num_layers=2)
-    trainer2 = LSTMTrainer(model2, lr=5e-4)
-
-    runner.run("LSTM_128_hidden_lr5e-4", model2, trainer2, train_loader, valid_loader)
-
-    # ---------------------
-    # Plot results
-    # ---------------------
-    runner.plot()
