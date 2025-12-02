@@ -1,7 +1,6 @@
 import time
 from typing import Dict, List, Optional, Tuple, Type
 
-import numpy as np
 import torch
 from torch import nn
 
@@ -14,6 +13,24 @@ def _select_device(device: Optional[str] = None) -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
     return torch.device("cpu")
+
+
+class EarlyStopping:
+    """Early stopping utility monitoring the validation loss."""
+
+    def __init__(self, patience: int = 10, min_delta: float = 0.0):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.best_loss: float = float("inf")
+        self.counter = 0
+
+    def step(self, loss: float) -> bool:
+        if loss < self.best_loss - self.min_delta:
+            self.best_loss = loss
+            self.counter = 0
+        else:
+            self.counter += 1
+        return self.counter >= self.patience
 
 
 class GRUModel(nn.Module):
@@ -58,10 +75,13 @@ class GRUModel(nn.Module):
         lr: Optional[float] = None,
         weight_decay: float = 0.0,
         verbose: bool = True,
+        patience: int = 10,
+        min_delta: float = 0.0,
     ) -> Dict[str, List[float]]:
         optimizer = self.optimizer_cls(self.parameters(), lr=lr or self.lr, weight_decay=weight_decay)
         criterion = nn.MSELoss()
         history = {"train_loss": [], "val_loss": [], "train_rmse": [], "val_rmse": [], "epoch_time": []}
+        stopper = EarlyStopping(patience=patience, min_delta=min_delta)
 
         if verbose:
             print("""\nGRU Training Metrics""")
@@ -87,6 +107,11 @@ class GRUModel(nn.Module):
                     f"{train_rmse:11.6f} {val_rmse:10.6f} "
                     f"{duration:7.2f}"
                 )
+
+            if stopper.step(val_loss):
+                if verbose:
+                    print(f"Arrêt anticipé à l'époque {epoch} (pas d'amélioration du MSE validation)")
+                break
 
         return history
 

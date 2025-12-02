@@ -29,8 +29,9 @@ class SequenceDataset(Dataset):
 def set_seed(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def parse_args() -> argparse.Namespace:
@@ -47,6 +48,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=5e-4, help="Learning rate (utilisé par défaut pour tous les modèles)")
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout des modèles séquentiels")
     parser.add_argument("--seed", type=int, default=42, help="Seed globale pour la reproductibilité")
+    parser.add_argument("--patience", type=int, default=10, help="Patience pour l'early stopping")
+    parser.add_argument("--min-delta", type=float, default=0.0, help="Amélioration minimale du MSE pour réinitialiser l'early stopping")
     return parser.parse_args()
 
 
@@ -153,7 +156,7 @@ def create_dataloaders(
     val_dataset = SequenceDataset(X_val, Y_val)
     test_dataset = SequenceDataset(X_test, Y_test)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
     return train_loader, val_loader, test_loader
@@ -201,6 +204,7 @@ def main() -> None:
     train_loader, val_loader, _ = create_dataloaders(X_seq, Y_seq, args.batch_size, args.train_ratio, args.val_ratio)
 
     input_size = X_seq.shape[2]
+    flattened_dim = args.seq_len * input_size
     histories: Dict[str, Dict[str, List[float]]] = {}
 
     # GRU
@@ -213,7 +217,14 @@ def main() -> None:
     )
     gru_label = f"GRU ({args.epochs} epochs, {args.gru_hidden} blocs, learning rate = {args.learning_rate})"
     start = time.time()
-    histories[gru_label] = gru_model.train_model(train_loader, val_loader, epochs=args.epochs, lr=args.learning_rate)
+    histories[gru_label] = gru_model.train_model(
+        train_loader,
+        val_loader,
+        epochs=args.epochs,
+        lr=args.learning_rate,
+        patience=args.patience,
+        min_delta=args.min_delta,
+    )
     print(f"Temps total GRU : {time.time() - start:.2f}s")
 
     # LSTM
@@ -226,15 +237,34 @@ def main() -> None:
     )
     lstm_label = f"LSTM ({args.epochs} epochs, {args.lstm_hidden} blocs, learning rate = {args.learning_rate})"
     start = time.time()
-    histories[lstm_label] = lstm_model.train_model(train_loader, val_loader, epochs=args.epochs, lr=args.learning_rate)
+    histories[lstm_label] = lstm_model.train_model(
+        train_loader,
+        val_loader,
+        epochs=args.epochs,
+        lr=args.learning_rate,
+        patience=args.patience,
+        min_delta=args.min_delta,
+    )
     print(f"Temps total LSTM : {time.time() - start:.2f}s")
 
     # MLP
     mlp_hidden = parse_mlp_hidden(args.mlp_hidden)
-    mlp_model = MLPModel(input_dim=input_size, hidden_dims=mlp_hidden, dropout=args.dropout, lr=args.learning_rate)
+    mlp_model = MLPModel(
+        input_dim=flattened_dim,
+        hidden_dims=mlp_hidden,
+        dropout=args.dropout,
+        lr=args.learning_rate,
+    )
     mlp_label = f"MLP ({args.epochs} epochs, hidden={mlp_hidden}, learning rate = {args.learning_rate})"
     start = time.time()
-    histories[mlp_label] = mlp_model.train_model(train_loader, val_loader, epochs=args.epochs, lr=args.learning_rate)
+    histories[mlp_label] = mlp_model.train_model(
+        train_loader,
+        val_loader,
+        epochs=args.epochs,
+        lr=args.learning_rate,
+        patience=args.patience,
+        min_delta=args.min_delta,
+    )
     print(f"Temps total MLP : {time.time() - start:.2f}s")
 
     plot_histories(histories)
