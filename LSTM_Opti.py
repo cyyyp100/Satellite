@@ -5,6 +5,7 @@ from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
 from typing import Dict, Any, List
 import pandas as pd
+import time  # ⏱ pour mesurer le temps par epoch
 
 
 class SatelliteSequenceDataset(Dataset):
@@ -16,10 +17,13 @@ class SatelliteSequenceDataset(Dataset):
         assert X.shape[0] == Y.shape[0], "X and Y must align in time"
 
         split = int(X.shape[0] * train_ratio)
+        self.split = split  # 🔹 pour retrouver l’index global validation
+
         self.X_train, self.Y_train = X[:split], Y[:split]
         self.X_valid, self.Y_valid = X[split:], Y[split:]
 
         self.train_mode = True
+
 
     def set_mode(self, mode="train"):
         self.train_mode = (mode == "train")
@@ -51,7 +55,7 @@ class LSTMModel(nn.Module):
         self.fc = nn.Linear(hidden_size, 3)
 
     def forward(self, x):
-        out, _ = self.lstm(x)        # LSTM renvoie (out, (h_n, c_n)), mais on s’en fout
+        out, _ = self.lstm(x)
         last = out[:, -1, :]
         return self.fc(last)
 
@@ -83,12 +87,24 @@ class LSTMTrainer:
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
         self.loss_fn = nn.MSELoss()
 
-        self.history = {"train_loss": [], "valid_loss": [], 
-                        "train_rmse": [], "valid_rmse": []}
+        self.history = {
+            "train_mse": [],
+            "valid_mse": [],
+            "train_rmse": [],
+            "valid_rmse": [],
+            "epoch_time": []
+        }
+
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer,
+            mode="min",
+            factor=0.5,
+            patience=20
+        )
 
     def train_epoch(self, loader):
         self.model.train()
-        losses, rmses = [], []
+        losses = []
 
         for X, y in loader:
             X, y = X.to(self.device), y.to(self.device)
@@ -101,14 +117,14 @@ class LSTMTrainer:
             self.optimizer.step()
 
             losses.append(loss.item())
-            rmse = np.sqrt(loss.item())
-            rmses.append(rmse)
 
-        return np.mean(losses), np.mean(rmses)
+        train_mse = np.mean(losses)
+        train_rmse = np.sqrt(train_mse)
+        return train_mse, train_rmse
 
     def eval_epoch(self, loader):
         self.model.eval()
-        losses, rmses = [], []
+        losses = []
 
         with torch.no_grad():
             for X, y in loader:
@@ -117,27 +133,40 @@ class LSTMTrainer:
                 loss = self.loss_fn(pred, y)
 
                 losses.append(loss.item())
-                rmses.append(np.sqrt(loss.item()))
 
-        return np.mean(losses), np.mean(rmses)
+        valid_mse = np.mean(losses)
+        valid_rmse = np.sqrt(valid_mse)
+        return valid_mse, valid_rmse
 
     def fit(self, train_loader, valid_loader, epochs=100, patience=20):
         es = EarlyStopping(patience=patience)
 
         for epoch in range(epochs):
-            train_loss, train_rmse = self.train_epoch(train_loader)
-            valid_loss, valid_rmse = self.eval_epoch(valid_loader)
+            start_time = time.time()  # ⏱ début epoch
 
-            self.history["train_loss"].append(train_loss)
-            self.history["valid_loss"].append(valid_loss)
+            train_mse, train_rmse = self.train_epoch(train_loader)
+            valid_mse, valid_rmse = self.eval_epoch(valid_loader)
+
+            epoch_time = time.time() - start_time
+
+            self.history["train_mse"].append(train_mse)
+            self.history["valid_mse"].append(valid_mse)
             self.history["train_rmse"].append(train_rmse)
             self.history["valid_rmse"].append(valid_rmse)
+            self.history["epoch_time"].append(epoch_time)
 
-            print(f"[EPOCH {epoch+1}] "
-                  f"Train Loss={train_loss:.6f} | Valid Loss={valid_loss:.6f} "
-                  f"| RMSE={valid_rmse:.6f}")
+            # 🔹 scheduler sur la loss de validation
+            self.scheduler.step(valid_mse)
 
-            es(valid_loss)
+            print(
+                f"[EPOCH {epoch+1:03d}] "
+                f"train_mse={train_mse:.6f} | "
+                f"valid_mse={valid_mse:.6f} | "
+                f"valid_rmse={valid_rmse:.6f} | "
+                f"temps_calcul={epoch_time:.3f}s"
+            )
+
+            es(valid_mse)
             if es.early_stop:
                 print("⛔ Early stopping triggered.")
                 break
@@ -171,10 +200,8 @@ class ExperimentRunner:
 
 if __name__ == "__main__":
 
-    # ---------------------
-    # Load real dataset
-    # ---------------------
-    csv_path = "datasetISS_200TLE.csv"  # adapter le chemin si besoin
+    #csv_path = "datasetISS_200TLE.csv"  
+    csv_path = "dataset_hst_sgp4_vs_horizons2.csv"
     df = pd.read_csv(csv_path, sep=";")
 
     # Supprimer dx, dy, dz si présents
@@ -264,18 +291,62 @@ if __name__ == "__main__":
     runner = ExperimentRunner()
 
     # Experiment 1
-    model1 = LSTMModel(input_size=18, hidden_size=64, num_layers=1)
-    trainer1 = LSTMTrainer(model1, lr=1e-3)
+    model1 = LSTMModel(input_size=18, hidden_size=128, num_layers=3)
+    trainer1 = LSTMTrainer(model1, lr=1e-4)
 
-    runner.run("LSTM_64_hidden_lr1e-3", model1, trainer1, train_loader, valid_loader)
+    runner.run("LSTM_128_hidden_lr1e-4", model1, trainer1, train_loader, valid_loader)
 
-    # Experiment 2
+    '''# Experiment 2
     model2 = LSTMModel(input_size=18, hidden_size=128, num_layers=2)
     trainer2 = LSTMTrainer(model2, lr=5e-4)
 
     runner.run("LSTM_128_hidden_lr5e-4", model2, trainer2, train_loader, valid_loader)
-
+    '''
     # ---------------------
-    # Plot results
+    # Plot results (RMSE)
     # ---------------------
     runner.plot()
+
+    # ---------------------
+    # Comparaison SGP4 vs Horizons vs modèle (sur la validation) — comme pour le GRU
+    # ---------------------
+    model1.eval()
+    device = trainer1.device
+
+    valid_set.set_mode("valid")
+    split = dataset.split
+    n_valid = dataset.X_valid.shape[0]
+
+    all_idx = []
+    pred_err_list = []
+
+    with torch.no_grad():
+        for i in range(n_valid - seq_len):
+            X_seq, _ = valid_set[i]
+            X_seq = X_seq.unsqueeze(0).to(device)
+            pred_err = model1(X_seq).cpu().numpy()[0]   # (3,)
+            pred_err_list.append(pred_err)
+
+            idx_global = split + i + seq_len - 1
+            all_idx.append(idx_global)
+
+    all_idx = np.array(all_idx)
+    pred_err = np.array(pred_err_list)
+
+    sgp4_pos = df.loc[all_idx, ["x_sgp4_km", "y_sgp4_km", "z_sgp4_km"]].values
+    horizons_pos = df.loc[all_idx, [x_h_col, y_h_col, z_h_col]].values
+
+    model_pos = sgp4_pos + pred_err
+
+    err_sgp4 = np.linalg.norm(horizons_pos - sgp4_pos, axis=1)
+    err_model = np.linalg.norm(horizons_pos - model_pos, axis=1)
+
+    plt.figure(figsize=(12, 5))
+    plt.plot(err_sgp4, label="Erreur 3D SGP4 → Horizons")
+    plt.plot(err_model, label="Erreur 3D Modèle LSTM (SGP4 + correction)", alpha=0.8)
+    plt.xlabel("Indice dans la série de validation")
+    plt.ylabel("Erreur 3D (km)")
+    plt.title("Comparaison des erreurs 3D : SGP4 vs modèle LSTM corrigé")
+    plt.legend()
+    plt.grid(True)
+    plt.show()

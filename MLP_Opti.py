@@ -3,6 +3,11 @@ import pandas as pd
 import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
+import os
+import time
+
+# Dossier de résultats
+os.makedirs("results", exist_ok=True)
 
 
 # ============================================================
@@ -121,11 +126,12 @@ def load_dataset_iss_flat(path_csv: str = "datasetISS_200TLE.csv"):
     X_std = X_all.std(axis=0, keepdims=True) + 1e-8
     X_all = (X_all - X_mean) / X_std
 
-    return X_all, Y_all, X_mean, X_std
+    # On retourne aussi df pour le CSV "erreurs par instant t"
+    return X_all, Y_all, X_mean, X_std, df
 
 
 # ============================================================
-# Entraînement MLP sur ISS
+# Entraînement MLP sur ISS (UNE expérience)
 # ============================================================
 def train_mlp_on_iss(
     csv_path: str = "datasetISS_200TLE.csv",
@@ -133,9 +139,10 @@ def train_mlp_on_iss(
     n_epochs: int = 100,
     lr: float = 5e-4,
     seq_len: int = 128,
+    hidden_dims=(256, 256, 128),
 ):
     # Charger les données (features "flat" X_all, erreurs Y_all)
-    X_all, Y_all, X_mean, X_std = load_dataset_iss_flat(csv_path)
+    X_all, Y_all, X_mean, X_std, df = load_dataset_iss_flat(csv_path)
 
     # Dataset séquentiel avec split temporel interne 80% / 20%
     train_ds = SatelliteSequenceDataset(X_all, Y_all, seq_len=seq_len, train_ratio=0.8)
@@ -155,7 +162,7 @@ def train_mlp_on_iss(
     print(f"Using device for MLP: {device}")
 
     input_dim = X_all.shape[1]
-    model = MLPModel(input_dim=input_dim, hidden_dims=(256, 256, 128), dropout=0.1)
+    model = MLPModel(input_dim=input_dim, hidden_dims=hidden_dims, dropout=0.1)
     model.to(device)
 
     criterion = nn.MSELoss()
@@ -164,7 +171,17 @@ def train_mlp_on_iss(
     def rmse_from_mse(mse: float) -> float:
         return float(np.sqrt(mse))
 
+    # ---- Historique pour création du CSV ----
+    history = {
+        "train_mse": [],
+        "val_mse": [],
+        "val_rmse": [],
+        "epoch_time": [],
+    }
+
     for epoch in range(1, n_epochs + 1):
+        start_time = time.time()
+
         # ---------- Entraînement ----------
         model.train()
         train_loss_sum = 0.0
@@ -202,15 +219,103 @@ def train_mlp_on_iss(
         val_mse = val_loss_sum / n_val
         val_rmse = rmse_from_mse(val_mse)
 
+        epoch_time = time.time() - start_time
+
+        # ---- On enregistre dans l'historique ----
+        history["train_mse"].append(train_mse)
+        history["val_mse"].append(val_mse)
+        history["val_rmse"].append(val_rmse)
+        history["epoch_time"].append(epoch_time)
+
         print(
             f"[MLP][Epoch {epoch:03d}] "
             f"Train MSE={train_mse:.6f} | Val MSE={val_mse:.6f} | "
-            f"Train RMSE={train_rmse:.6f} | Val RMSE={val_rmse:.6f}"
+            f"Train RMSE={train_rmse:.6f} | Val RMSE={val_rmse:.6f} | "
+            f"Temps={epoch_time:.3f}s"
         )
+
+    # =====================================================
+    # 1) CSV MÉTRIQUES PAR EPOCH (dans results/)
+    # =====================================================
+    df_metrics = pd.DataFrame({
+        "Train_MSE": history["train_mse"],
+        "Val_MSE": history["val_mse"],
+        "Val_RMSE": history["val_rmse"],
+        "Temps_calcul_s": history["epoch_time"],
+    })
+    df_metrics.index = np.arange(1, len(df_metrics) + 1)
+    df_metrics.index.name = "Epoch"
+
+    hidden_str = "-".join(str(h) for h in hidden_dims)
+    metrics_filename = f"Metrics_MLP_LR{lr}_HL{hidden_str}.csv"
+    metrics_filepath = os.path.join("results", metrics_filename)
+
+    df_metrics.to_csv(metrics_filepath)
+    print(f"✅ Fichier CSV MLP (métriques) créé : {metrics_filepath}")
+
+    # =====================================================
+    # 2) CSV ERREURS PAR INSTANT t (dans results/)
+    # =====================================================
+    model.eval()
+    preds = []
+
+    # On prédit pour chaque instant à partir de seq_len-1 (pour avoir une séquence complète)
+    with torch.no_grad():
+        for i in range(seq_len - 1, len(X_all)):
+            seq = X_all[i - seq_len + 1: i + 1]                  # (seq_len, input_dim)
+            seq_tensor = torch.from_numpy(seq).unsqueeze(0).to(device)  # (1, seq_len, input_dim)
+            out = model(seq_tensor)                              # (1, 3)
+            preds.append(out.cpu().numpy().squeeze())
+
+    preds = np.array(preds)  # (N - seq_len + 1, 3)
+
+    # Aligner avec le dataframe original
+    df_sub = df.iloc[seq_len - 1:].copy().reset_index(drop=True)
+
+    # Ajout des prédictions (erreurs apprises)
+    df_sub["err_x_pred"] = preds[:, 0]
+    df_sub["err_y_pred"] = preds[:, 1]
+    df_sub["err_z_pred"] = preds[:, 2]
+
+    # On garde exactement ce que tu as demandé + les erreurs prédites
+    df_errors = df_sub[[
+        "x_sgp4_km", "y_sgp4_km", "z_sgp4_km",
+        "x_horizons_km", "y_horizons_km", "z_horizons_km",
+        "err_x_pred", "err_y_pred", "err_z_pred",
+    ]]
+
+    error_filename = f"Erreur_MLP_LR{lr}_HL{hidden_str}.csv"
+    error_filepath = os.path.join("results", error_filename)
+    df_errors.to_csv(error_filepath, index=False)
+
+    print(f"✅ Fichier CSV MLP (erreurs par t) créé : {error_filepath}")
 
     return model, X_mean, X_std
 
 
+# ============================================================
+# LANCEMENT DE PLUSIEURS EXPÉRIENCES
+# ============================================================
 if __name__ == "__main__":
-    # Entraînement du MLP sur le dataset ISS SGP4 vs Horizons
-    train_mlp_on_iss()
+
+    experiments = [
+        {"lr": 1e-3, "hidden_dims": (256, 256, 128)},
+        {"lr": 5e-4, "hidden_dims": (256, 256, 128)},
+        {"lr": 1e-4, "hidden_dims": (256, 256, 128)},
+        {"lr": 1e-4, "hidden_dims": (512, 256, 128)},
+        # tu peux en rajouter autant que tu veux
+    ]
+
+    for i, cfg in enumerate(experiments, start=1):
+        print("\n" + "=" * 70)
+        print(f"MLP EXPERIMENT {i} | lr={cfg['lr']} | hidden_dims={cfg['hidden_dims']}")
+        print("=" * 70)
+
+        train_mlp_on_iss(
+            csv_path="datasetISS_200TLE.csv",
+            batch_size=256,
+            n_epochs=100,
+            lr=cfg["lr"],
+            seq_len=128,
+            hidden_dims=cfg["hidden_dims"],
+        )

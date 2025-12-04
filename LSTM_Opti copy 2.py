@@ -2,13 +2,12 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+# import matplotlib.pyplot as plt   # plus besoin si tu ne fais aucun graphique
 from typing import Dict, Any, List
 import pandas as pd
-import time
+import time 
+import openpyxl
 import os
-
-# Dossier résultat
-os.makedirs("results", exist_ok=True)
 
 
 class SatelliteSequenceDataset(Dataset):
@@ -20,11 +19,13 @@ class SatelliteSequenceDataset(Dataset):
         assert X.shape[0] == Y.shape[0], "X and Y must align in time"
 
         split = int(X.shape[0] * train_ratio)
-        self.split = split
+        self.split = split  # 🔹 pour retrouver l’index global validation
+
         self.X_train, self.Y_train = X[:split], Y[:split]
         self.X_valid, self.Y_valid = X[split:], Y[split:]
 
         self.train_mode = True
+
 
     def set_mode(self, mode="train"):
         self.train_mode = (mode == "train")
@@ -37,31 +38,27 @@ class SatelliteSequenceDataset(Dataset):
         X_data = self.X_train if self.train_mode else self.X_valid
         Y_data = self.Y_train if self.train_mode else self.Y_valid
 
-        X_seq = X_data[idx: idx + self.seq_len]        # (seq_len, features)
-        y = Y_data[idx + self.seq_len - 1]             # prédiction du dernier pas
+        X_seq = X_data[idx : idx + self.seq_len]        # (seq_len, features)
+        y = Y_data[idx + self.seq_len - 1]              # prédiction du dernier pas
 
         return torch.tensor(X_seq, dtype=torch.float32), torch.tensor(y, dtype=torch.float32)
 
 
-class GRUModel(nn.Module):
-    def __init__(self, input_size, hidden_size=128, num_layers=2, dropout=0.1):
+class LSTMModel(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers):
         super().__init__()
-
-        self.gru = nn.GRU(
+        self.lstm = nn.LSTM(
             input_size=input_size,
             hidden_size=hidden_size,
             num_layers=num_layers,
             batch_first=True,
-            dropout=dropout
+            dropout=0.1 if num_layers > 1 else 0.0,
         )
-
-        # Couche finale pour prédire x,y,z (erreurs)
         self.fc = nn.Linear(hidden_size, 3)
 
     def forward(self, x):
-        # x shape : (batch, seq_len, features)
-        out, h = self.gru(x)
-        last = out[:, -1, :]  # dernier état caché
+        out, _ = self.lstm(x)
+        last = out[:, -1, :]
         return self.fc(last)
 
 
@@ -84,28 +81,29 @@ class EarlyStopping:
             self.early_stop = True
 
 
-class GRUTrainer:
+class LSTMTrainer:
     def __init__(self, model, lr=1e-3, device="mps"):
         self.device = torch.device(device if torch.backends.mps.is_available() else "cpu")
         print(f"Using device: {self.device}")
         self.model = model.to(self.device)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
         self.loss_fn = nn.MSELoss()
+        self.lr = lr  # 👈 pour garder une trace du learning rate
+
+        self.history = {
+            "train_mse": [],
+            "valid_mse": [],
+            "train_rmse": [],
+            "valid_rmse": [],
+            "epoch_time": []
+        }
+
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer,
             mode="min",
-            factor=0.5,      # divise le LR par 2
-            patience=10,     # après 10 epochs sans amélioration
-            min_lr=1e-6,
+            factor=0.5,
+            patience=20
         )
-
-        self.history = {
-            "train_loss": [],
-            "valid_loss": [],
-            "train_rmse": [],
-            "valid_rmse": [],
-            "epoch_time": [],
-        }
 
     def train_epoch(self, loader):
         self.model.train()
@@ -147,31 +145,31 @@ class GRUTrainer:
         es = EarlyStopping(patience=patience)
 
         for epoch in range(epochs):
-            start_time = time.time()
+            start_time = time.time()  # ⏱ début epoch
 
-            train_loss, train_rmse = self.train_epoch(train_loader)
-            valid_loss, valid_rmse = self.eval_epoch(valid_loader)
+            train_mse, train_rmse = self.train_epoch(train_loader)
+            valid_mse, valid_rmse = self.eval_epoch(valid_loader)
 
-            epoch_time = time.time()  
+            epoch_time = time.time() - start_time
 
-            # Log
-            self.history["train_loss"].append(train_loss)
-            self.history["valid_loss"].append(valid_loss)
+            self.history["train_mse"].append(train_mse)
+            self.history["valid_mse"].append(valid_mse)
             self.history["train_rmse"].append(train_rmse)
             self.history["valid_rmse"].append(valid_rmse)
             self.history["epoch_time"].append(epoch_time)
 
-            self.scheduler.step(valid_loss)
+            # 🔹 scheduler sur la loss de validation
+            self.scheduler.step(valid_mse)
 
             print(
                 f"[EPOCH {epoch+1:03d}] "
-                f"train_mse={train_loss:.6f} | "
-                f"valid_mse={valid_loss:.6f} | "
+                f"train_mse={train_mse:.6f} | "
+                f"valid_mse={valid_mse:.6f} | "
                 f"valid_rmse={valid_rmse:.6f} | "
-                f"temps={epoch_time:.3f}s"
+                f"temps_calcul={epoch_time:.3f}s"
             )
 
-            es(valid_loss)
+            es(valid_mse)
             if es.early_stop:
                 print("⛔ Early stopping triggered.")
                 break
@@ -189,13 +187,15 @@ class ExperimentRunner:
         self.results.append({"name": name, "history": history})
         return history
 
+    # La fonction plot est inutile maintenant, tu peux la supprimer ou la laisser non utilisée
+    # def plot(self):
+    #     ...
+
 
 if __name__ == "__main__":
 
-    # ---------------------
-    # Load real dataset
-    # ---------------------
-    csv_path = "datasetISS_200TLE.csv"  # adapter le chemin si besoin
+    csv_path = "datasetISS_200TLE.csv"  
+    # csv_path = "dataset_hst_sgp4_vs_horizons2.csv"
     df = pd.read_csv(csv_path, sep=";")
 
     # Supprimer dx, dy, dz si présents
@@ -278,12 +278,12 @@ if __name__ == "__main__":
 
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
     valid_loader = DataLoader(valid_set, batch_size=batch_size, shuffle=False)
-
     # ---------------------
     # RUN MULTIPLE EXPERIMENTS
     # ---------------------
     runner = ExperimentRunner()
 
+    # Liste des expériences que tu veux lancer
     experiments = [
         {"hidden_size": 64,  "num_layers": 1, "lr": 1e-3},
         {"hidden_size": 64,  "num_layers": 1, "lr": 1e-4},
@@ -293,75 +293,84 @@ if __name__ == "__main__":
         {"hidden_size": 128, "num_layers": 3, "lr": 5e-5},
     ]
 
-    input_size = X.shape[1]
+    input_size = X.shape[1]  # normalement 18
 
     for exp_id, cfg in enumerate(experiments, start=1):
         hidden_size = cfg["hidden_size"]
         num_layers = cfg["num_layers"]
         lr = cfg["lr"]
 
-        print("\n" + "=" * 70)
-        print(f"🚀 GRU EXPERIMENT {exp_id} | hidden_size={hidden_size} | num_layers={num_layers} | lr={lr}")
-        print("=" * 70)
+        print("\n" + "="*70)
+        print(f"🚀 EXPERIMENT {exp_id} | hidden_size={hidden_size} | num_layers={num_layers} | lr={lr}")
+        print("="*70)
 
-        model = GRUModel(input_size=input_size, hidden_size=hidden_size, num_layers=num_layers)
-        trainer = GRUTrainer(model, lr=lr)
+        # Modèle + trainer
+        model = LSTMModel(input_size=input_size, hidden_size=hidden_size, num_layers=num_layers)
+        trainer = LSTMTrainer(model, lr=lr)
 
-        exp_name = f"GRU_H{hidden_size}_L{num_layers}_LR{lr}"
+        # Entraînement
+        exp_name = f"LSTM_H{hidden_size}_L{num_layers}_LR{lr}"
         history = runner.run(exp_name, model, trainer, train_loader, valid_loader)
 
         # =======================
         # 1) CSV METRICS PAR EPOCH
         # =======================
         df_metrics = pd.DataFrame({
-            "Train_MSE": history["train_loss"],
-            "Val_MSE": history["valid_loss"],
+            "Train_MSE": history["train_mse"],
+            "Val_MSE": history["valid_mse"],
             "Val_RMSE": history["valid_rmse"],
             "Temps_calcul_s": history["epoch_time"],
         })
+
+        # Ajouter une colonne Epoch qui commence à 1
         df_metrics.index = np.arange(1, len(df_metrics) + 1)
         df_metrics.index.name = "Epoch"
 
-        metrics_filename = f"Metrics_GRU_LR{lr}_HL{hidden_size}_L{num_layers}.csv"
+        metrics_filename = f"Metrics_LSTM_LR{lr}_HL{hidden_size}_L{num_layers}.csv"
         metrics_filepath = os.path.join("results", metrics_filename)
         df_metrics.to_csv(metrics_filepath)
+
         print(f"✅ Fichier de métriques créé : {metrics_filepath}")
 
         # =======================
-        # 2) CSV ERREURS PAR INSTANT t (sur tout le dataset)
+        # 2) CSV ERREURS PAR INSTANT t
         # =======================
         model.eval()
         preds = []
-        device = trainer.device
 
+        # On va prédire pour chaque instant à partir de seq_len-1
         with torch.no_grad():
             for i in range(seq_len - 1, len(X)):
-                seq = X[i - seq_len + 1: i + 1]  # (seq_len, input_size)
-                seq_tensor = torch.from_numpy(seq).unsqueeze(0).to(device)  # (1, seq_len, input_size)
-                out = model(seq_tensor)  # (1, 3)
+                # Séquence [i - seq_len + 1, ..., i]
+                seq = X[i - seq_len + 1 : i + 1]            # (seq_len, input_size)
+                seq_tensor = torch.from_numpy(seq).unsqueeze(0).to(trainer.device)  # (1, seq_len, input_size)
+                out = model(seq_tensor)                    # (1, 3)
                 preds.append(out.cpu().numpy().squeeze())
 
-        preds = np.array(preds)  # (N - seq_len + 1, 3)
+        preds = np.array(preds)  # shape: (N - seq_len + 1, 3)
 
-        # Alignement avec le df complet
-        df_sub = df.iloc[seq_len - 1:].copy().reset_index(drop=True)
+        # On aligne avec le DataFrame d'origine à partir de l'indice seq_len-1
+        df_sub = df.iloc[seq_len - 1 :].copy().reset_index(drop=True)
 
-        # Harmonisation des noms horizons
-        df_sub["x_horizons_km"] = df[x_h_col].iloc[seq_len - 1:].values
-        df_sub["y_horizons_km"] = df[y_h_col].iloc[seq_len - 1:].values
-        df_sub["z_horizons_km"] = df[z_h_col].iloc[seq_len - 1:].values
+        # On force les noms Horizons "propres" dans le fichier de sortie
+        df_sub["x_horizons_km"] = df[x_h_col].iloc[seq_len - 1 :].values
+        df_sub["y_horizons_km"] = df[y_h_col].iloc[seq_len - 1 :].values
+        df_sub["z_horizons_km"] = df[z_h_col].iloc[seq_len - 1 :].values
 
+        # Ajout des prédictions du LSTM (erreurs apprises)
         df_sub["err_x_pred"] = preds[:, 0]
         df_sub["err_y_pred"] = preds[:, 1]
         df_sub["err_z_pred"] = preds[:, 2]
 
+        # On ne garde que les colonnes demandées + prédictions
         df_errors = df_sub[[
             "x_sgp4_km", "y_sgp4_km", "z_sgp4_km",
             "x_horizons_km", "y_horizons_km", "z_horizons_km",
             "err_x_pred", "err_y_pred", "err_z_pred",
         ]]
 
-        error_filename = f"Erreur_GRU_LR{lr}_HL{hidden_size}_L{num_layers}.csv"
+        error_filename = f"Erreur_LSTM_LR{lr}_HL{hidden_size}_L{num_layers}.csv"
         error_filepath = os.path.join("results", error_filename)
         df_errors.to_csv(error_filepath, index=False)
-        print(f" Fichier d'erreurs créé : {error_filepath}")
+
+        print(f"✅ Fichier d'erreurs créé : {error_filepath}")
