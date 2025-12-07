@@ -9,7 +9,7 @@ import os
 os.makedirs("results", exist_ok=True)
 
 # =========================================================
-#  DATASET SEQUENTIEL — SPLIT 70 / 15 / 15
+#  DATASET 70 / 15 / 15
 # =========================================================
 class SatelliteSequenceDataset:
     def __init__(self, X, Y, seq_len=128):
@@ -22,8 +22,8 @@ class SatelliteSequenceDataset:
         self.n_valid = int(0.15 * n)
         self.n_test  = n - self.n_train - self.n_valid
 
-        self.X_train = X[:self.n_train]
-        self.Y_train = Y[:self.n_train]
+        self.X_train = X[: self.n_train]
+        self.Y_train = Y[: self.n_train]
 
         self.X_valid = X[self.n_train : self.n_train + self.n_valid]
         self.Y_valid = Y[self.n_train : self.n_train + self.n_valid]
@@ -31,58 +31,54 @@ class SatelliteSequenceDataset:
         self.X_test  = X[self.n_train + self.n_valid :]
         self.Y_test  = Y[self.n_train + self.n_valid :]
 
-        print(f"[Dataset] Train={len(self.X_train)}, Valid={len(self.X_valid)}, Test={len(self.X_test)}")
+        print(f"Dataset split: train={len(self.X_train)}, valid={len(self.X_valid)}, test={len(self.X_test)}")
 
     def get_loader(self, subset, batch_size=32, shuffle=False):
         X = getattr(self, f"X_{subset}")
         Y = getattr(self, f"Y_{subset}")
 
-        class SeqDataset(Dataset):
+        class SubsetDataset(Dataset):
             def __len__(self2):
                 return len(X) - self.seq_len
 
             def __getitem__(self2, idx):
-                X_seq = X[idx: idx + self.seq_len]
+                X_seq = X[idx : idx + self.seq_len]
                 y = Y[idx + self.seq_len - 1]
                 return torch.tensor(X_seq, dtype=torch.float32), torch.tensor(y, dtype=torch.float32)
 
-        return DataLoader(SeqDataset(), batch_size=batch_size, shuffle=shuffle)
+        return DataLoader(SubsetDataset(), batch_size=batch_size, shuffle=shuffle)
 
 
 # =========================================================
-#  MODELE GRU
+#  MODEL LSTM
 # =========================================================
-class GRUModel(nn.Module):
-    def __init__(self, input_size, hidden_size=128, num_layers=2, dropout=0.1):
+class LSTMModel(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers):
         super().__init__()
-        self.gru = nn.GRU(
+        self.lstm = nn.LSTM(
             input_size=input_size,
             hidden_size=hidden_size,
             num_layers=num_layers,
             batch_first=True,
-            dropout=dropout if num_layers > 1 else 0.0
+            dropout=0.1 if num_layers > 1 else 0.0,
         )
         self.fc = nn.Linear(hidden_size, 3)
 
     def forward(self, x):
-        out, _ = self.gru(x)
+        out, _ = self.lstm(x)
         return self.fc(out[:, -1, :])
 
 
 # =========================================================
-#  TRAINER (AVEC TEST SET)
+#  TRAINER (train + valid + test)
 # =========================================================
-class GRUTrainer:
+class LSTMTrainer:
     def __init__(self, model, lr=1e-3, device="mps"):
-        self.device = torch.device(
-            "mps" if torch.backends.mps.is_available()
-            else "cuda" if torch.cuda.is_available()
-            else "cpu"
-        )
-        print("Device:", self.device)
+        self.device = torch.device(device if torch.backends.mps.is_available() else "cpu")
+        print("Using:", self.device)
 
         self.model = model.to(self.device)
-        self.optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
         self.loss_fn = nn.MSELoss()
 
         self.history = {
@@ -92,7 +88,7 @@ class GRUTrainer:
             "epoch_time": []
         }
 
-    def _eval(self, loader):
+    def eval_epoch(self, loader):
         self.model.eval()
         losses = []
         with torch.no_grad():
@@ -110,33 +106,43 @@ class GRUTrainer:
             X, y = X.to(self.device), y.to(self.device)
             pred = self.model(X)
             loss = self.loss_fn(pred, y)
+
             self.optimizer.zero_grad()
             loss.backward()
             self.optimizer.step()
+
             losses.append(loss.item())
+
         mse = np.mean(losses)
         return mse, np.sqrt(mse)
 
-    def fit(self, train_loader, valid_loader, test_loader, epochs=120):
-        for epoch in range(1, epochs+1):
+    def fit(self, train_loader, valid_loader, test_loader, epochs=150):
+        for epoch in range(epochs):
             t0 = time.time()
+
             train_mse, train_rmse = self.train_epoch(train_loader)
-            valid_mse, valid_rmse = self._eval(valid_loader)
-            test_mse,  test_rmse  = self._eval(test_loader)
+            valid_mse, valid_rmse = self.eval_epoch(valid_loader)
+            test_mse,  test_rmse  = self.eval_epoch(test_loader)
+
             dt = time.time() - t0
 
             self.history["train_mse"].append(train_mse)
             self.history["train_rmse"].append(train_rmse)
+
             self.history["valid_mse"].append(valid_mse)
             self.history["valid_rmse"].append(valid_rmse)
+
             self.history["test_mse"].append(test_mse)
             self.history["test_rmse"].append(test_rmse)
+
             self.history["epoch_time"].append(dt)
 
             print(
-                f"[EPOCH {epoch:03d}] "
-                f"Train={train_mse:.6f} | Valid={valid_mse:.6f} | Test={test_mse:.6f} | "
-                f"Time={dt:.2f}s"
+                f"[EPOCH {epoch+1:03d}] "
+                f"train={train_mse:.5f} | "
+                f"valid={valid_mse:.5f} | "
+                f"test={test_mse:.5f} | "
+                f"time={dt:.2f}s"
             )
 
         return self.history
@@ -147,47 +153,42 @@ class GRUTrainer:
 # =========================================================
 if __name__ == "__main__":
 
-    # -------- Chargement CSV --------
     df = pd.read_csv("datasetISS_200TLE.csv", sep=";")
 
-    for col in ["dx_km", "dy_km", "dz_km"]:
-        if col in df.columns:
-            df = df.drop(columns=[col])
+    for c in ["dx_km", "dy_km", "dz_km"]:
+        if c in df.columns:
+            df = df.drop(columns=[c])
 
-    # -------- Features --------
     X_cols = [
         "time_utc", "tle_index", "tle_epoch", "dt_since_tle_s",
         "mean_motion", "orbital_speed_km_s", "mean_motion_derivative",
-        "altitude_drift_km_per_day", "bstar",
-        "inclination_deg", "raan_deg", "eccentricity",
-        "arg_perigee_deg", "mean_anomaly_deg", "rev_number",
+        "altitude_drift_km_per_day", "bstar", "inclination_deg",
+        "raan_deg", "eccentricity", "arg_perigee_deg",
+        "mean_anomaly_deg", "rev_number",
         "x_sgp4_km", "y_sgp4_km", "z_sgp4_km"
     ]
 
-    # Convert time → numeric
     df["time_utc"] = pd.to_datetime(df["time_utc"]).astype("int64") / 1e9
     df["tle_epoch"] = pd.to_datetime(df["tle_epoch"]).astype("int64") / 1e9
 
-    # Horizons columns helper
-    def find_col(candidates):
-        for cand in candidates:
-            for col in df.columns:
-                if cand.lower() in col.lower():
-                    return col
-        raise Exception("Column missing:", candidates)
+    def find_col(names):
+        for n in names:
+            for c in df.columns:
+                if n.lower() in c.lower():
+                    return c
+        raise Exception("Missing horizons column", names)
 
-    x_h_col = find_col(["x_horizons"])
-    y_h_col = find_col(["y_horizons"])
-    z_h_col = find_col(["z_horizons"])
+    x_h = find_col(["x_horizons"])
+    y_h = find_col(["y_horizons"])
+    z_h = find_col(["z_horizons"])
 
-    df["err_x"] = df[x_h_col] - df["x_sgp4_km"]
-    df["err_y"] = df[y_h_col] - df["y_sgp4_km"]
-    df["err_z"] = df[z_h_col] - df["z_sgp4_km"]
+    df["err_x"] = df[x_h] - df["x_sgp4_km"]
+    df["err_y"] = df[y_h] - df["y_sgp4_km"]
+    df["err_z"] = df[z_h] - df["z_sgp4_km"]
 
     X = df[X_cols].values.astype(np.float32)
-    Y = df[["err_x","err_y","err_z"]].values.astype(np.float32)
+    Y = df[["err_x", "err_y", "err_z"]].values.astype(np.float32)
 
-    # -------- Normalisation --------
     X_mean = X.mean(0, keepdims=True)
     X_std  = X.std(0, keepdims=True) + 1e-8
     X = (X - X_mean) / X_std
@@ -195,80 +196,76 @@ if __name__ == "__main__":
     seq_len = 128
     batch_size = 32
 
-    # -------- Dataset 70/15/15 --------
     dataset = SatelliteSequenceDataset(X, Y, seq_len=seq_len)
 
     train_loader = dataset.get_loader("train", batch_size=batch_size, shuffle=True)
     valid_loader = dataset.get_loader("valid", batch_size=batch_size, shuffle=False)
     test_loader  = dataset.get_loader("test",  batch_size=batch_size, shuffle=False)
 
-    # -------- EXPERIMENTS --------
     experiments = [
-        {"hidden": 64, "layers": 1, "lr": 1e-3},
-        {"hidden": 64, "layers": 1, "lr": 1e-4},
+        {"hidden": 64,  "layers": 1, "lr": 1e-3},
         {"hidden": 128, "layers": 3, "lr": 1e-4},
     ]
 
-    input_size = X.shape[1]
-
     for cfg in experiments:
-        print("\n" + "="*70)
-        print(f"🚀 GRU EXPERIMENT | hidden={cfg['hidden']} | layers={cfg['layers']} | lr={cfg['lr']}")
-        print("="*70)
+        model = LSTMModel(
+            input_size=X.shape[1],
+            hidden_size=cfg["hidden"],
+            num_layers=cfg["layers"]
+        )
 
-        model = GRUModel(input_size, hidden_size=cfg["hidden"], num_layers=cfg["layers"])
-        trainer = GRUTrainer(model, lr=cfg["lr"])
-
+        trainer = LSTMTrainer(model, lr=cfg["lr"])
         hist = trainer.fit(train_loader, valid_loader, test_loader, epochs=80)
 
-        # ---------------------------------------------------------
-        # 1) CSV METRICS (TRAIN + VALID + TEST)
-        # ---------------------------------------------------------
         df_metrics = pd.DataFrame({
             "Train_MSE": hist["train_mse"],
             "Train_RMSE": hist["train_rmse"],
-            "Valid_MSE": hist["valid_mse"],
-            "Valid_RMSE": hist["valid_rmse"],
-            "Test_MSE":  hist["test_mse"],
+            "Val_MSE": hist["valid_mse"],
+            "Val_RMSE": hist["valid_rmse"],
+            "Test_MSE": hist["test_mse"],
             "Test_RMSE": hist["test_rmse"],
-            "Time_s":    hist["epoch_time"]
+            "Time": hist["epoch_time"]
         })
 
-        metrics_path = f"results/Metrics_GRU_H{cfg['hidden']}_L{cfg['layers']}_LR{cfg['lr']}.csv"
-        df_metrics.to_csv(metrics_path, index=False)
-        print("📄 Saved metrics:", metrics_path)
+        df_metrics.index = np.arange(1, len(df_metrics)+1)
+        df_metrics.index.name = "Epoch"
 
-        # ---------------------------------------------------------
-        # 2) CSV ERREURS SUR LE TEST SET
-        # ---------------------------------------------------------
-        print("Computing test predictions...")
+        out_csv = f"results/Metrics_LSTM_H{cfg['hidden']}_L{cfg['layers']}.csv"
+        df_metrics.to_csv(out_csv)
+        print("Saved metrics:", out_csv)
 
-        df_test = df.iloc[dataset.n_train + dataset.n_valid:].reset_index(drop=True)
-        X_test = dataset.X_test
+        # =====================================================
+        #   CSV ERREURS VALID
+        # =====================================================
+        def compute_prediction_csv(X_subset, df_subset, name):
+            preds = []
+            model.eval()
+            with torch.no_grad():
+                for i in range(seq_len - 1, len(X_subset)):
+                    seq = X_subset[i-seq_len+1:i+1]
+                    seq_t = torch.from_numpy(seq).unsqueeze(0).to(trainer.device)
+                    out = model(seq_t)
+                    preds.append(out.cpu().numpy().squeeze())
 
-        preds = []
-        model.eval()
+            preds = np.array(preds)
 
-        with torch.no_grad():
-            for i in range(seq_len-1, len(X_test)):
-                seq = torch.tensor(X_test[i-seq_len+1:i+1], dtype=torch.float32).unsqueeze(0).to(trainer.device)
-                preds.append(model(seq).cpu().numpy().squeeze())
+            df_sub = df_subset.iloc[seq_len-1:].reset_index(drop=True)
+            df_sub["err_x_pred"] = preds[:,0]
+            df_sub["err_y_pred"] = preds[:,1]
+            df_sub["err_z_pred"] = preds[:,2]
 
-        preds = np.array(preds)
+            out = df_sub[
+                ["x_sgp4_km","y_sgp4_km","z_sgp4_km",
+                 x_h, y_h, z_h,
+                 "err_x_pred","err_y_pred","err_z_pred"]
+            ]
 
-        df_sub = df_test.iloc[seq_len-1:].copy().reset_index(drop=True)
-        df_sub["err_x_pred"] = preds[:,0]
-        df_sub["err_y_pred"] = preds[:,1]
-        df_sub["err_z_pred"] = preds[:,2]
+            out_file = f"results/Erreur_{name}_LSTM_H{cfg['hidden']}_L{cfg['layers']}.csv"
+            out.to_csv(out_file, index=False)
+            print("Saved:", out_file)
 
-        df_errors = df_sub[
-            ["x_sgp4_km","y_sgp4_km","z_sgp4_km",
-             x_h_col, y_h_col, z_h_col,
-             "err_x_pred","err_y_pred","err_z_pred"]
-        ]
+        df_valid = df.iloc[dataset.n_train : dataset.n_train+dataset.n_valid]
+        df_test  = df.iloc[dataset.n_train+dataset.n_valid :]
 
-        out_path = f"results/Erreur_TEST_GRU_H{cfg['hidden']}_L{cfg['layers']}_LR{cfg['lr']}.csv"
-        df_errors.to_csv(out_path, index=False)
-
-        print("🎯 Saved test error file:", out_path)
-
+        compute_prediction_csv(dataset.X_valid, df_valid, "VALID")
+        compute_prediction_csv(dataset.X_test,  df_test,  "TEST")

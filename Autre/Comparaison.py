@@ -9,7 +9,7 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from GRU import GRUModel
+from Autre.GRU import GRUModel
 from LSTM import LSTMModel
 from MLP import MLPModel
 
