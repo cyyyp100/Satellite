@@ -9,7 +9,7 @@ import os
 os.makedirs("results", exist_ok=True)
 
 # =========================================================
-#  DATASET SEQUENTIEL — SPLIT 70 / 15 / 15
+#  DATASET SEQUENTIEL
 # =========================================================
 class SatelliteSequenceDataset:
     def __init__(self, X, Y, seq_len=128):
@@ -70,7 +70,7 @@ class GRUModel(nn.Module):
 
 
 # =========================================================
-#  TRAINER (AVEC TEST SET)
+#  TRAINER 
 # =========================================================
 class GRUTrainer:
     def __init__(self, model, lr=1e-3, device="mps"):
@@ -143,11 +143,10 @@ class GRUTrainer:
 
 
 # =========================================================
-#  CODE PRINCIPAL
+#  MAIN
 # =========================================================
 if __name__ == "__main__":
 
-    # -------- Chargement CSV --------
     df = pd.read_csv("datasetISS_200TLE.csv", sep=";")
 
     for col in ["dx_km", "dy_km", "dz_km"]:
@@ -164,11 +163,9 @@ if __name__ == "__main__":
         "x_sgp4_km", "y_sgp4_km", "z_sgp4_km"
     ]
 
-    # Convert time → numeric
     df["time_utc"] = pd.to_datetime(df["time_utc"]).astype("int64") / 1e9
     df["tle_epoch"] = pd.to_datetime(df["tle_epoch"]).astype("int64") / 1e9
 
-    # Horizons columns helper
     def find_col(candidates):
         for cand in candidates:
             for col in df.columns:
@@ -195,7 +192,7 @@ if __name__ == "__main__":
     seq_len = 128
     batch_size = 32
 
-    # -------- Dataset 70/15/15 --------
+    # -------- Dataset --------
     dataset = SatelliteSequenceDataset(X, Y, seq_len=seq_len)
 
     train_loader = dataset.get_loader("train", batch_size=batch_size, shuffle=True)

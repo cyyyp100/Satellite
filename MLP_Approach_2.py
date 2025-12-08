@@ -9,7 +9,7 @@ import time
 os.makedirs("results", exist_ok=True)
 
 # ============================================================
-# Dataset séquentiel 70 / 15 / 15
+# Dataset 
 # ============================================================
 class SatelliteSequenceDataset:
     def __init__(self, X, Y, seq_len=128):
@@ -68,7 +68,7 @@ class MLPModel(nn.Module):
 
 
 # ============================================================
-# Chargement dataset ISS + features/errors
+# DATASET
 # ============================================================
 def load_dataset_iss_flat(path_csv="datasetISS_200TLE.csv"):
     df = pd.read_csv(path_csv, sep=";")
@@ -104,7 +104,7 @@ def load_dataset_iss_flat(path_csv="datasetISS_200TLE.csv"):
 
 
 # ============================================================
-# Entraînement du MLP avec TRAIN/VALID/TEST
+# TRAIN
 # ============================================================
 def train_mlp_on_iss(
     csv_path="datasetISS_200TLE.csv",
@@ -222,7 +222,7 @@ def train_mlp_on_iss(
          "err_x_pred", "err_y_pred", "err_z_pred"]
     ]
 
-    error_path = f"results/Erreur_TEST_MLP_LR{lr}_HL{hidden_str}.csv"
+    error_path = f"results/Test_Predictions_MLP_LR{lr}_HL{hidden_str}.csv"
     df_errors.to_csv(error_path, index=False)
     print("Saved test error file:", error_path)
 

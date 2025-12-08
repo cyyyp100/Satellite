@@ -81,7 +81,7 @@ class EarlyStopping:
 
 
 # =========================================================
-#  TRAINER AVEC EXPORT TEST
+#  TRAINER
 # =========================================================
 class LSTMTrainer:
     def __init__(self, model, lr=1e-3, device="mps"):
@@ -126,9 +126,7 @@ class LSTMTrainer:
         rmse = np.sqrt(mse)
         return mse, rmse
 
-    # -------------------------
-    # EXPORT PREDICTIONS TEST
-    # -------------------------
+
     def predict_test(self, loader):
         self.model.eval()
         preds = []
@@ -181,7 +179,7 @@ class LSTMTrainer:
 
 
 # =========================================================
-#  CODE PRINCIPAL — SPLIT PAR TLE
+#  MAIN 
 # =========================================================
 if __name__ == "__main__":
 
@@ -243,7 +241,6 @@ if __name__ == "__main__":
 
     print(f"SPLIT → Train={len(idx_train)}, Valid={len(idx_valid)}, Test={len(idx_test)}")
 
-    # Dataset instances
     dataset_train = SatelliteSequenceDataset(X, Y, seq_len=50)
     dataset_valid = SatelliteSequenceDataset(X, Y, seq_len=50)
     dataset_test  = SatelliteSequenceDataset(X, Y, seq_len=50)
@@ -260,8 +257,12 @@ if __name__ == "__main__":
     # EXPÉRIMENTS
     # =====================================================
     experiments = [
-        {"hidden_size":64,  "num_layers":1, "lr":1e-3},
-        {"hidden_size":128, "num_layers":3, "lr":1e-4}
+        {"hidden_size": 64,  "num_layers": 1, "lr": 1e-3},
+        {"hidden_size": 64,  "num_layers": 1, "lr": 1e-4},
+        {"hidden_size": 64,  "num_layers": 3, "lr": 1e-4},
+        {"hidden_size": 128, "num_layers": 1, "lr": 1e-4},
+        {"hidden_size": 128, "num_layers": 3, "lr": 1e-4},
+        {"hidden_size": 128, "num_layers": 3, "lr": 5e-5},
     ]
 
     input_size = X.shape[1]
@@ -278,7 +279,7 @@ if __name__ == "__main__":
         history = trainer.fit(train_loader, valid_loader, test_loader, epochs=120)
 
         df_metrics = pd.DataFrame(history)
-        out_path = f"results/Metrics_SPLIT_TLE_LSTM_H{cfg['hidden_size']}_L{cfg['num_layers']}.csv"
+        out_path = f"results/Metrics_LSTM_H{cfg['hidden_size']}_L{cfg['num_layers']}_seqlen50.csv"
         df_metrics.to_csv(out_path, index=False)
         print(f"💾 Saved metrics: {out_path}")
 
@@ -296,6 +297,6 @@ if __name__ == "__main__":
         df_test["y_corrected"] = df_test["y_sgp4_km"] + df_test["pred_err_y"]
         df_test["z_corrected"] = df_test["z_sgp4_km"] + df_test["pred_err_z"]
 
-        out_path2 = f"results/Test_Predictions_LSTM_H{cfg['hidden_size']}_L{cfg['num_layers']}.csv"
+        out_path2 = f"results/Test_Predictions_LSTM_H{cfg['hidden_size']}_L{cfg['num_layers']}_seqlen50.csv"
         df_test.to_csv(out_path2, index=False)
         print(f"📄 Saved corrected predictions: {out_path2}")

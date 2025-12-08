@@ -10,7 +10,7 @@ os.makedirs("results", exist_ok=True)
 
 
 # =========================================================
-#  DATASET — SPLIT PAR TLE
+#  DATASET — SPLIT ON TLE
 # =========================================================
 class SatelliteSequenceDataset(Dataset):
     def __init__(self, X, Y, seq_len, indices):
@@ -37,7 +37,7 @@ class SatelliteSequenceDataset(Dataset):
 
 
 # =========================================================
-#  TRANSFORMER ORBITAL — VERSION AMÉLIORÉE (SANS POSENC)
+#  TRANSFORMER (Regressive encoder)
 # =========================================================
 class TransformerOrbital(nn.Module):
     def __init__(self, input_size, d_model=128, nhead=4, num_layers=3, dim_feedforward=256):
@@ -75,10 +75,10 @@ class TransformerOrbital(nn.Module):
 
 
 # =========================================================
-#  TRAINER AVEC NORMALISATION Y + WARMUP
+#  TRAINER + WARMUP
 # =========================================================
 class TransformerTrainer:
-    def __init__(self, model, Y_mean, Y_std, lr=1e-4, warmup_steps=200, device="mps"):
+    def __init__(self, model, Y_mean, Y_std, lr=1e-4, warmup_steps=200, device="mps", early_stop_patience=10):
         self.device = torch.device(device if torch.backends.mps.is_available() else "cpu")
         print("Using:", self.device)
 
@@ -90,6 +90,11 @@ class TransformerTrainer:
         self.Y_std  = torch.tensor(Y_std, dtype=torch.float32).to(self.device)
         self.warmup_steps = warmup_steps
         self.step_count = 0
+
+        self.early_stop_patience = early_stop_patience
+        self.best_valid_rmse = float("inf")
+        self.no_improve_count = 0
+        self.best_state = None
 
         self.history = {
             "train_mse": [], "train_rmse": [],
@@ -179,12 +184,26 @@ class TransformerTrainer:
                 f"[EPOCH {epoch+1:03d}] Train={train_rmse:.4f} | Valid={valid_rmse:.4f} | Test={test_rmse:.4f}"
             )
 
+            #early stopping 
+            if valid_rmse < self.best_valid_rmse:
+                self.best_valid_rmse = valid_rmse
+                self.no_improve_count = 0
+                self.best_state = {k: v.clone() for k, v in self.model.state_dict().items()}
+            else:
+                self.no_improve_count += 1
+
+            if self.no_improve_count >= self.early_stop_patience:
+                print(f"\n⏹ Early stopping triggered at epoch {epoch+1}! Best valid RMSE={self.best_valid_rmse:.4f}")
+                if self.best_state is not None:
+                    self.model.load_state_dict(self.best_state)
+                break
+
         return self.history
 
 
 
 # =========================================================
-#  MAIN CODE — SPLIT PAR TLE
+#  MAIN 
 # =========================================================
 if __name__ == "__main__":
 
@@ -228,11 +247,10 @@ if __name__ == "__main__":
 
     Y_mean = Y.mean(0, keepdims=True)
     Y_std  = Y.std(0, keepdims=True) + 1e-8
-    Y_norm = (Y - Y_mean) / Y_std
 
-    seq_len = 50
+    seq_len = 128
 
-    # SPLIT PAR TLE
+    # Split en TLE
     tle_ids = df["tle_index"].unique()
     n = len(tle_ids)
 
@@ -248,15 +266,14 @@ if __name__ == "__main__":
     idx_valid = df.index[df["tle_index"].isin(tle_valid)].tolist()
     idx_test  = df.index[df["tle_index"].isin(tle_test)].tolist()
 
-    train_ds = SatelliteSequenceDataset(X, Y_norm, seq_len, idx_train)
-    valid_ds = SatelliteSequenceDataset(X, Y_norm, seq_len, idx_valid)
-    test_ds  = SatelliteSequenceDataset(X, Y_norm, seq_len, idx_test)
+    train_ds = SatelliteSequenceDataset(X, Y, seq_len, idx_train)
+    valid_ds = SatelliteSequenceDataset(X, Y, seq_len, idx_valid)
+    test_ds  = SatelliteSequenceDataset(X, Y, seq_len, idx_test)
 
     train_loader = DataLoader(train_ds, batch_size=32, shuffle=True)
     valid_loader = DataLoader(valid_ds, batch_size=32, shuffle=False)
     test_loader  = DataLoader(test_ds, batch_size=32, shuffle=False)
 
-    # MODEL
     model = TransformerOrbital(
         input_size=X.shape[1],
         d_model=128,
@@ -266,11 +283,10 @@ if __name__ == "__main__":
     )
 
     trainer = TransformerTrainer(model, Y_mean, Y_std, lr=1e-4, warmup_steps=200)
-    hist = trainer.fit(train_loader, valid_loader, test_loader, epochs=5)
+    hist = trainer.fit(train_loader, valid_loader, test_loader, epochs=50)
 
-    # SAVE METRICS
     df_metrics = pd.DataFrame(hist)
-    df_metrics.to_csv("results/Metrics_Transformer_Improved.csv", index=False)
+    df_metrics.to_csv("results/Metrics_Transformer.csv", index=False)
     print("Saved metrics")
 
     # =========================================================
@@ -287,7 +303,7 @@ if __name__ == "__main__":
     df_test["y_corrected"] = df_test["y_sgp4_km"] + df_test["pred_err_y"]
     df_test["z_corrected"] = df_test["z_sgp4_km"] + df_test["pred_err_z"]
 
-    out_path = "results/Test_Predictions.csv"
+    out_path = "results/Test_Predictions_Transformer.csv"
     df_test.to_csv(out_path, index=False)
 
     print("Saved detailed test predictions to:", out_path)
@@ -312,7 +328,6 @@ if __name__ == "__main__":
     df_extra["time_utc"]  = pd.to_datetime(df_extra["time_utc"]).astype("int64") / 1e9
     df_extra["tle_epoch"] = pd.to_datetime(df_extra["tle_epoch"]).astype("int64") / 1e9
 
-    # Horizons columns
     def find_col_extra(names):
         for col in df_extra.columns:
             for n in names:
@@ -329,28 +344,23 @@ if __name__ == "__main__":
     df_extra["err_y"] = df_extra[y_h_e] - df_extra["y_sgp4_km"]
     df_extra["err_z"] = df_extra[z_h_e] - df_extra["z_sgp4_km"]
 
-    # Prepare features
     X_extra = df_extra[X_cols].values.astype(np.float32)
     Y_extra = df_extra[["err_x","err_y","err_z"]].values.astype(np.float32)
 
     # Apply SAME normalization as training
     X_extra = (X_extra - X.mean(0, keepdims=True)) / (X.std(0, keepdims=True) + 1e-8)
-    Y_extra_norm = (Y_extra - Y_mean) / Y_std
 
-    # Build dataset for sequence inference (same class as train)
     idx_extra = df_extra.index.values.tolist()
-    extra_ds = SatelliteSequenceDataset(X_extra, Y_extra_norm, seq_len, idx_extra)
+    extra_ds = SatelliteSequenceDataset(X_extra, Y_extra, seq_len, idx_extra)
     extra_loader = DataLoader(extra_ds, batch_size=32, shuffle=False)
 
-        # Run predictions
     model.eval()
     preds_norm = []
-    true_norm = []
+    true_list = []
 
     with torch.no_grad():
         for batch in extra_loader:
 
-            # --- robust extraction of (X, y) ---
             if isinstance(batch, (list, tuple)):
                 if len(batch) >= 2:
                     Xb, yb = batch[0], batch[1]
@@ -359,23 +369,19 @@ if __name__ == "__main__":
             else:
                 raise ValueError(f"Batch is not a tuple/list: type={type(batch)}")
 
-            # -----------------------------------
 
             Xb = Xb.to(trainer.device)
             pred_b = model(Xb)
 
             preds_norm.append(pred_b.cpu().numpy())
-            true_norm.append(yb.numpy())
+            true_list.append(yb.numpy())
 
 
     preds_norm = np.vstack(preds_norm)
-    true_norm = np.vstack(true_norm)
+    true = np.vstack(true_list)
 
-    # Denormalize predictions
     preds = preds_norm * Y_std + Y_mean
-    true  = true_norm * Y_std + Y_mean
 
-    # Align dataframe rows with predictions (due to sequence window)
     df_out = df_extra.iloc[seq_len:].copy()
 
     df_out["pred_err_x"] = preds[:,0]
@@ -386,7 +392,6 @@ if __name__ == "__main__":
     df_out["y_corrected"] = df_out["y_sgp4_km"] + df_out["pred_err_y"]
     df_out["z_corrected"] = df_out["z_sgp4_km"] + df_out["pred_err_z"]
 
-    # RMSE on external dataset
     rmse_extra = np.sqrt(np.mean((preds - true)**2))
     print(f"\n📊 Extra dataset RMSE: {rmse_extra:.4f} km")
 
